@@ -1,0 +1,81 @@
+# ── Device & Hardware ──────────────────────────────────────────────────────────
+mode: train
+gpu_ids: [ 0 ]
+accelerator: gpu
+devices: 1
+strategy: auto
+batch_size: 1          # one story sequence per step
+num_workers: 0         # must be 0 to prevent HDF5 file-handle conflicts in cloud
+pin_memory: True
+accumulate_grad_batches: 4   # effective batch = 4; keeps per-step memory low
+num_cpu_cores: -1
+seed: 0
+
+# ── Checkpointing ──────────────────────────────────────────────────────────────
+ckpt_dir: ./ckpts
+run_name: visdrone_run
+save_every_n_epochs: 1       # save after every epoch to avoid losing progress
+
+# ── Task ───────────────────────────────────────────────────────────────────────
+dataset: visdrone
+task: continuation           # auto-regressive story continuation
+
+# ── Training ───────────────────────────────────────────────────────────────────
+init_lr: 1e-5
+warmup_epochs: 1
+max_epochs: 40
+train_model_file:            # path to checkpoint to resume from (leave blank to start fresh)
+freeze_clip: True            # freeze CLIP text encoder
+freeze_blip: True            # freeze BLIP multimodal encoder
+freeze_resnet: False         # unfreeze ResNet for geometric/structural refinement
+
+# ── Sampling / Inference ───────────────────────────────────────────────────────
+test_model_file:             # path to checkpoint to use for sampling
+calculate_fid: True
+scheduler: ddim              # ddim | pndm
+guidance_scale: 7.5          # 7.5 = realistic colors; higher values oversaturate
+num_inference_steps: 150     # DDIM steps; higher = sharper, slower
+limit_predict_batches: 10    # number of test batches to sample
+sample_output_dir: ./ckpts/visdrone_run/samples
+
+# ── Dataset Configs ────────────────────────────────────────────────────────────
+pororo:
+  hdf5_file: /path/to/pororo.h5
+  max_length: 85
+  new_tokens: [ "pororo", "loopy", "eddy", "harry", "poby", "tongtong", "crong", "rody", "petty" ]
+  clip_embedding_tokens: 49416
+  blip_embedding_tokens: 30530
+
+flintstones:
+  hdf5_file: /path/to/flintstones.h5
+  max_length: 91
+  new_tokens: [ "fred", "barney", "wilma", "betty", "pebbles", "dino", "slate" ]
+  clip_embedding_tokens: 49412
+  blip_embedding_tokens: 30525
+
+vistsis:
+  hdf5_file: /path/to/vist.h5
+  max_length: 100
+  clip_embedding_tokens: 49408
+  blip_embedding_tokens: 30524
+
+vistdii:
+  hdf5_file: /path/to/vist.h5
+  max_length: 65
+  clip_embedding_tokens: 49408
+  blip_embedding_tokens: 30524
+
+visdrone:
+  hdf5_file: visdrone.h5
+  max_length: 77
+  new_tokens: []
+  clip_embedding_tokens: 49408
+  blip_embedding_tokens: 30524
+
+# ── Hydra ──────────────────────────────────────────────────────────────────────
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+hydra/job_logging: disabled
+hydra/hydra_logging: disabled

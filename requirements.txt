@@ -1,0 +1,11 @@
+pytorch-lightning
+transformers
+diffusers
+timm
+ftfy
+hydra-core
+opencv-python
+h5py
+scipy
+tensorboard
+modal
