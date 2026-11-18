@@ -22,6 +22,14 @@ from timm.models.hub import download_cached_file
 
 
 class BLIP_Base(nn.Module):
+    """
+    BLIP base model for extracting image and text features.
+
+    Differs from the original BLIP: uses a modified BertModel that supports multimodal mode
+    and a VisionTransformer with attention map extraction capabilities. This version is tailored
+    for feature extraction rather than end-to-end pretraining.
+    """
+
     def __init__(self,
                  med_config='models/blip_override/med_config.json',
                  image_size=224,
@@ -37,29 +45,33 @@ class BLIP_Base(nn.Module):
         """
         super().__init__()
 
+        # Initialize vision encoder (ViT) with specified size.
         self.visual_encoder, vision_width = create_vit(vit, image_size, vit_grad_ckpt, vit_ckpt_layer)
         self.tokenizer = init_tokenizer()
         med_config = BertConfig.from_json_file(med_config)
         med_config.encoder_width = vision_width
+        # Text encoder with the vision width set as encoder width for cross-attention.
         self.text_encoder = BertModel(config=med_config, add_pooling_layer=False)
 
     def forward(self, image, text, attention_mask, mode):
+        # Supports three forward modes depending on what features we need.
         assert mode in ['image', 'text', 'multimodal'], "mode parameter must be image, text, or multimodal"
         if mode == 'image':
-            # return image features
+            # Extract image features from vision encoder.
             image_embeds = self.visual_encoder(image)
             return image_embeds
 
         elif mode == 'text':
-            # return text features
+            # Extract text features from text encoder. Uses 'mode=text' to get pure text processing.
             text_output = self.text_encoder(text, attention_mask=attention_mask, return_dict=True, mode='text')
             return text_output.last_hidden_state
 
         elif mode == 'multimodal':
-            # return multimodel features
+            # Process image and text together for multimodal understanding.
             image_embeds = self.visual_encoder(image)
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
+            # Prepend [ENC] token to text for the encoder-decoder attention pattern.
             text[:, 0] = self.tokenizer.enc_token_id
             output = self.text_encoder(text,
                                        attention_mask=attention_mask,
@@ -71,6 +83,14 @@ class BLIP_Base(nn.Module):
 
 
 class BLIP_Decoder(nn.Module):
+    """
+    BLIP decoder for image captioning.
+
+    Differs from the original BLIP decoder: uses BertLMHeadModel with multimodal cross-attention,
+    allowing the decoder to attend to visual features while generating text. The prompt prefix
+    guides generation toward image descriptions.
+    """
+
     def __init__(self,
                  med_config='models/blip_override/med_config.json',
                  image_size=384,
@@ -97,7 +117,7 @@ class BLIP_Decoder(nn.Module):
         self.prompt_length = len(self.tokenizer(self.prompt).input_ids) - 1
 
     def forward(self, image, caption):
-
+        # Training forward pass: compute language modeling loss for image captioning.
         image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
@@ -106,6 +126,7 @@ class BLIP_Decoder(nn.Module):
 
         text.input_ids[:, 0] = self.tokenizer.bos_token_id
 
+        # Mask padding tokens and prompt tokens in the loss - they shouldn't count toward the LM loss.
         decoder_targets = text.input_ids.masked_fill(text.input_ids == self.tokenizer.pad_token_id, -100)
         decoder_targets[:, :self.prompt_length] = -100
 
@@ -122,21 +143,25 @@ class BLIP_Decoder(nn.Module):
 
     def generate(self, image, sample=False, num_beams=3, max_length=30, min_length=10, top_p=0.9,
                  repetition_penalty=1.0):
+        # Inference: generate captions for images.
         image_embeds = self.visual_encoder(image)
 
+        # For beam search, replicate image embeddings to match beam count.
         if not sample:
             image_embeds = image_embeds.repeat_interleave(num_beams, dim=0)
 
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         model_kwargs = {"encoder_hidden_states": image_embeds, "encoder_attention_mask": image_atts}
 
+        # Initialize generation with the prompt prefix.
         prompt = [self.prompt] * image.size(0)
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(image.device)
         input_ids[:, 0] = self.tokenizer.bos_token_id
         input_ids = input_ids[:, :-1]
 
+        # Choose between nucleus sampling (random) or beam search (deterministic).
         if sample:
-            # nucleus sampling
+            # Nucleus sampling: randomly sample from top-p probability mass.
             outputs = self.text_decoder.generate(input_ids=input_ids,
                                                  max_length=max_length,
                                                  min_length=min_length,
@@ -148,7 +173,7 @@ class BLIP_Decoder(nn.Module):
                                                  repetition_penalty=1.1,
                                                  **model_kwargs)
         else:
-            # beam search
+            # Beam search: find the most likely sequence via breadth-first exploration.
             outputs = self.text_decoder.generate(input_ids=input_ids,
                                                  max_length=max_length,
                                                  min_length=min_length,
@@ -158,6 +183,7 @@ class BLIP_Decoder(nn.Module):
                                                  repetition_penalty=repetition_penalty,
                                                  **model_kwargs)
 
+        # Decode tokens to text and remove the prompt prefix.
         captions = []
         for output in outputs:
             caption = self.tokenizer.decode(output, skip_special_tokens=True)

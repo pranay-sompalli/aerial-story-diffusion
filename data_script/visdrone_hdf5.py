@@ -7,7 +7,8 @@ from PIL import Image
 from tqdm import tqdm
 
 def main():
-    # Use environment variables if on Modal, otherwise use local defaults
+    # 1. Establish paths for raw image files and text descriptions (JSON)
+    # Check if we are running in the cloud (Modal environment) or on a local Mac
     data_base = "/root/ARLDM/data" if os.path.exists("/root/ARLDM/data") else "."
     
     save_path = "visdrone.h5"
@@ -15,14 +16,15 @@ def main():
     images_dir = os.path.join(data_base, "raw_images")
     
     if not os.path.exists(gemini_json):
-        # Fallback for local Mac if not in the root
+        # Fallback local paths for development/testing
         gemini_json = "/Users/pranaysompalli/Documents/AeroDiffusion/text_descriptions/gemini.json"
         images_dir = "/Users/pranaysompalli/Documents/AeroDiffusion/VisDrone2019-DET-train/images"
     
+    # Load all image description text
     with open(gemini_json, "r") as f:
         descriptions = json.load(f)
     
-    # We will get all image filenames from the JSON, filter only those that exist
+    # 2. Filter descriptions and verify that corresponding images exist locally
     valid_data = []
     for img_name, desc in descriptions.items():
         img_path = os.path.join(images_dir, img_name)
@@ -31,16 +33,12 @@ def main():
     
     print(f"Found {len(valid_data)} valid image-description pairs.")
     
-    # Shuffle data (optional, but good for splits)
-    np.random.seed(42)
-    # We convert to a numpy array for shuffling? No, random.shuffle on list is better or just convert to array of tuples.
-    # List of tuples is fine, but np.random.shuffle works on lists too.
-    # Let's use Python's random instead of numpy to avoid 2D array string conversion issues.
+    # 3. Seed and shuffle the data to ensure even distribution during splits
     import random
     random.seed(42)
     random.shuffle(valid_data)
     
-    # 80/10/10 split
+    # 4. Standard 80/10/10 split for training, validation, and testing
     total = len(valid_data)
     train_end = int(0.8 * total)
     val_end = int(0.9 * total)
@@ -53,28 +51,38 @@ def main():
     
     print(f"Splits: Train {len(splits['train'])}, Val {len(splits['val'])}, Test {len(splits['test'])}")
     
+    # 5. Create HDF5 database to write processed splits
     f = h5py.File(save_path, "w")
     for subset, data in splits.items():
         length = len(data)
         group = f.create_group(subset)
+        
+        # We need to simulate a 5-frame sequence for the story model.
+        # Initialize datasets for image0 ... image4 containing variable-length compressed byte arrays.
         images_dsets = []
         for i in range(5):
             images_dsets.append(
                 group.create_dataset(f'image{i}', (length,), dtype=h5py.vlen_dtype(np.dtype('uint8'))))
+        
+        # Dataset to hold concatenated caption strings
         text_dset = group.create_dataset('text', (length,), dtype=h5py.string_dtype(encoding='utf-8'))
         
+        # 6. Process and write each image-description pair to HDF5
         for i, (img_path, desc) in enumerate(tqdm(data, desc=f"Processing {subset}")):
-            # Process Image
+            # Load the image, ensure it is in RGB, and resize to standard 512x512
             img = Image.open(img_path).convert('RGB').resize((512, 512))
             img_arr = np.array(img).astype(np.uint8)
+            
+            # Encode image as compressed PNG bytes to conserve HDF5 storage space
             img_bytes = cv2.imencode('.png', img_arr)[1].tobytes()
             img_buf = np.frombuffer(img_bytes, np.uint8)
             
+            # Since VisDrone is originally a single-frame detection dataset, 
+            # we duplicate the single image across all 5 frames to simulate a static sequence.
             for j in range(5):
                 images_dsets[j][i] = img_buf
             
-            # Process Text
-            # We only have 1 description per image, so we duplicate it 5 times separated by '|'
+            # Clean and duplicate the text caption 5 times, joined by pipe characters '|'.
             clean_desc = desc.replace('\n', '').replace('\t', '').strip()
             txt_variations = [clean_desc for _ in range(5)]
             text_dset[i] = '|'.join(txt_variations)
@@ -84,3 +92,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -1,29 +1,59 @@
 # ── Device & Hardware ──────────────────────────────────────────────────────────
 mode: train
 gpu_ids: [ 0 ]
-accelerator: gpu
+accelerator: gpu        # mps (Mac M-series) | gpu (CUDA/Modal A100) | cpu
 devices: 1
 strategy: auto
-batch_size: 1          # one story sequence per step
-num_workers: 0         # must be 0 to prevent HDF5 file-handle conflicts in cloud
-pin_memory: True
-accumulate_grad_batches: 4   # effective batch = 4; keeps per-step memory low
+batch_size: 2          # one story sequence per step (keeps memory around 5 GB)
+num_workers: 4         # prevents duplicate child Python processes from taking RAM
+pin_memory: True      # pin_memory is not supported on MPS; set True for CUDA
+accumulate_grad_batches: 4   # effective batch = 8; stabilises transformer grads on MPS
 num_cpu_cores: -1
 seed: 0
 
 # ── Checkpointing ──────────────────────────────────────────────────────────────
 ckpt_dir: ./ckpts
-run_name: visdrone_run
+run_name: visdrone_dit_b_vit_init
 save_every_n_epochs: 1       # save after every epoch to avoid losing progress
 
 # ── Task ───────────────────────────────────────────────────────────────────────
 dataset: visdrone
 task: continuation           # auto-regressive story continuation
 
+# ── Model Backbone ─────────────────────────────────────────────────────────────
+backbone: perceiver_dit     # perceiver_dit | unet
+
+# ── PerceiverIO-DiT Architecture Config ────────────────────────────────────────
+dit:
+  sample_size: 64           # VAE latent spatial size (512 // 8 = 64)
+  patch_size: 2             # 2x2 patches -> 32x32 = 1024 tokens
+  hidden_size: 768          # DiT hidden dimension (DiT-B: 768, DiT-S: 384, DiT-L: 1024)
+  depth: 12                 # Number of DiT transformer blocks
+  num_heads: 12             # Attention heads
+  mlp_ratio: 4.0            # FFN expansion ratio
+  dropout: 0.0
+  use_conv_stem: True       # Residual 3x3 conv stem/head for local aerial continuity
+  overlapping_patch: False  # Symmetric non-overlapping 2x2 patch projection matching unpatchify layout
+  # ── ViT-B Pre-Trained Weight Transfer ─────────────────────────────────────
+  init_from_vit: True       # Transfer ViT-B/16 ImageNet weights into DiT-B blocks
+  vit_model_name: vit_base_patch16_224   # timm model id; must match hidden_size=768, depth=12
+
+perceiver:
+  num_latents: 64           # Number of bottleneck latent queries
+  latent_dim: 768           # Perceiver latent query dimension
+  depth: 2                  # Number of latent self-attention layers
+  num_heads: 8              # Perceiver attention heads
+  dropout: 0.0
+
 # ── Training ───────────────────────────────────────────────────────────────────
-init_lr: 1e-5
-warmup_epochs: 1
-max_epochs: 40
+init_lr: 3e-6            # baseline learning rate
+pos_gate_lr: 1e-4        # rapid LR for Deep Positional Gates to lock coordinate grid
+conv_lr: 2.5e-5          # fast LR for Pre/Post Conv stems to learn sharp edge filters
+perceiver_lr: 3e-6       # stable LR for Perceiver IO context resampler
+backbone_lr: 6e-6        # stepped up LR for DiT blocks to actively un-learn wavy manifold
+edge_loss_weight: 0.25   # 5x stronger Sobel gradient penalty to force straight building walls
+warmup_epochs: 2         # 2-epoch linear warmup for stable cross-attention & adaLN-Zero
+max_epochs: 1
 train_model_file:            # path to checkpoint to resume from (leave blank to start fresh)
 freeze_clip: True            # freeze CLIP text encoder
 freeze_blip: True            # freeze BLIP multimodal encoder
@@ -32,11 +62,13 @@ freeze_resnet: False         # unfreeze ResNet for geometric/structural refineme
 # ── Sampling / Inference ───────────────────────────────────────────────────────
 test_model_file:             # path to checkpoint to use for sampling
 calculate_fid: True
-scheduler: ddim              # ddim | pndm
-guidance_scale: 7.5          # 7.5 = realistic colors; higher values oversaturate
-num_inference_steps: 150     # DDIM steps; higher = sharper, slower
-limit_predict_batches: 10    # number of test batches to sample
-sample_output_dir: ./ckpts/visdrone_run/samples
+scheduler: sde-dpm           # 2nd-order SDE-DPMSolver++ with Karras sigmas for sharp straight edges
+guidance_scale: 1.8          # 1.8 - 2.2 prevents edge warping/wobble while maintaining prompt fidelity
+num_inference_steps: 50      # 50 DDIM steps is optimal; 200 accumulates high-frequency drift
+limit_predict_batches: 1    # number of test batches to sample
+limit_train_batches: null      # null for all batches, or an int to limit for quick profiling
+limit_val_batches: null        # null for all validation batches, or an int
+sample_output_dir: ./ckpts/visdrone_dit_b_vit_init/samples
 
 # ── Dataset Configs ────────────────────────────────────────────────────────────
 pororo:

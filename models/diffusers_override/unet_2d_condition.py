@@ -267,51 +267,46 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             [`~models.unet_2d_condition.UNet2DConditionOutput`] if `return_dict` is True, otherwise a `tuple`. When
             returning a tuple, the first element is the sample tensor.
         """
-        # By default samples have to be AT least a multiple of the overall upsampling factor.
-        # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).
-        # However, the upsampling interpolation output size can be forced to fit any upsampling size
-        # on the fly if necessary.
+        # Determine the upsampling factor and whether we need to adjust output size.
+        # The upsampling factor is 2^(number of upsamplers), since each upsamples by 2x.
         default_overall_up_factor = 2 ** self.num_upsamplers
 
-        # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
         forward_upsample_size = False
         upsample_size = None
 
+        # If input dimensions aren't multiples of the upsampling factor, we'll need to force the output size.
         if any(s % default_overall_up_factor != 0 for s in sample.shape[-2:]):
             logger.info("Forward upsample size to force interpolation output size.")
             forward_upsample_size = True
 
-        # 0. center input if necessary
+        # Optionally center input to [-1, 1] range (standard for diffusion models).
         if self.config.center_input_sample:
             sample = 2 * sample - 1.0
 
-        # 1. time
+        # Process timestep to create time embedding for conditioning.
         timesteps = timestep
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
 
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        # Use a safe way to get the dtype that bypasses the buggy ModelMixin.dtype property
+        # Cast to match model dtype (time projection returns float32, but model may be float16).
         t_emb = t_emb.to(dtype=self.conv_in.weight.dtype)
         emb = self.time_embedding(t_emb)
 
-        # 2. pre-process
+        # 2. Pre-process: project input to the base channel dimension.
         sample = self.conv_in(sample)
 
-        # 3. down
+        # 3. Down path: progressively downsample with skip connection storage.
+        # Each block outputs intermediate features for skip connections in the up path.
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "attentions") and downsample_block.attentions is not None:
+                # Cross-attention blocks receive text/context embeddings.
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
@@ -323,19 +318,18 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
-        # 4. mid
+        # 4. Mid block: process bottleneck representation at lowest resolution.
         sample = self.mid_block(sample, emb, encoder_hidden_states=encoder_hidden_states,
                                 encoder_attention_mask=encoder_attention_mask)
 
-        # 5. up
+        # 5. Up path: progressively upsample and combine with skip connections.
+        # The skip connections provide fine-grained spatial details to help reconstruction.
         for i, upsample_block in enumerate(self.up_blocks):
             is_final_block = i == len(self.up_blocks) - 1
 
             res_samples = down_block_res_samples[-len(upsample_block.resnets):]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
-            # if we have not reached the final block and need to forward the
-            # upsample size, we do it here
             if not is_final_block and forward_upsample_size:
                 upsample_size = down_block_res_samples[-1].shape[2:]
 
@@ -352,7 +346,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                 sample = upsample_block(
                     hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
                 )
-        # 6. post-process
+        # 6. Post-process: normalize, activate, and project to output channels.
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)

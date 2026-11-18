@@ -41,10 +41,10 @@ class StoryDataset(Dataset):
         self.h5_file = args.get(args.dataset).hdf5_file
         self.subset = subset
 
-        # Transform applied to story frames during training/validation
+        # Main image augmentation pipeline. Raw frames are resized to 512x512 for progressive fine-tuning.
         self.augment = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize([384, 384]),
+            transforms.Resize([512, 512]),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
@@ -52,7 +52,8 @@ class StoryDataset(Dataset):
         self.dataset = args.dataset
         self.max_length = args.get(args.dataset).max_length
 
-        # CLIP tokenizer
+        # Set up CLIP tokenizer: used for text conditioning during diffusion generation (Stable Diffusion).
+        # We also register any custom/new tokens added specifically for our domain.
         if clip_tokenizer is None:
             self.clip_tokenizer = CLIPTokenizer.from_pretrained(
                 'runwayml/stable-diffusion-v1-5', subfolder="tokenizer"
@@ -62,7 +63,7 @@ class StoryDataset(Dataset):
         else:
             self.clip_tokenizer = clip_tokenizer
 
-        # BLIP tokenizer
+        # Set up BLIP tokenizer: used for contextual encoding of captions within the multimodal encoder.
         if blip_tokenizer is None:
             self.blip_tokenizer = init_tokenizer()
             added = self.blip_tokenizer.add_tokens(list(args.get(args.dataset).new_tokens))
@@ -70,7 +71,8 @@ class StoryDataset(Dataset):
         else:
             self.blip_tokenizer = blip_tokenizer
 
-        # BLIP image processor — fixed at 224x224 (BLIP model requirement)
+        # BLIP image processor: prepares conditioning frames for the ViT encoder.
+        # This requires 224x224 images normalized with ImageNet statistics.
         self.blip_image_processor = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize([224, 224]),
@@ -80,10 +82,15 @@ class StoryDataset(Dataset):
         ])
 
     def open_h5(self):
-        """Lazily open the HDF5 file on first access (avoids pickling issues with multiprocessing)."""
+        """
+        Lazily open the HDF5 file on the first access.
+        This prevents file descriptors from being shared across multiprocessing
+        workers, avoiding issues when PyTorch DataLoader uses num_workers > 0.
+        """
         print(f"--- Opening HDF5 file: {self.h5_file} ---", flush=True)
         try:
-            h5 = h5py.File(self.h5_file, "r")
+            # Set rdcc_nbytes=1MB and rdcc_w0=0.0 to prevent HDF5 from caching gigabytes of raw chunks in RAM
+            h5 = h5py.File(self.h5_file, "r", rdcc_nbytes=1024 * 1024, rdcc_w0=0.0)
             self.h5 = h5[self.subset]
             print(f"--- HDF5 opened successfully ---", flush=True)
         except Exception as e:
@@ -91,32 +98,38 @@ class StoryDataset(Dataset):
             raise
 
     def __getitem__(self, index: int):
+        # Ensure the HDF5 file handle is opened for the current process/worker
         if not hasattr(self, 'h5'):
             self.open_h5()
 
-        # Load and decode all 5 frames from JPEG bytes
+        # Load and decode all 5 sequential frames of the story from compressed JPEG bytes
         images = []
         for i in range(5):
             raw = self.h5[f'image{i}'][index]
             buf = np.frombuffer(raw, dtype=np.uint8)
             img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # OpenCV uses BGR; convert to RGB
             images.append(img)
 
-        # BLIP source images (all 5 frames at 224x224)
+        # Prepare source conditioning images (all 5 frames) for the BLIP encoder at 224x224
         source_images: Tensor = torch.stack([self.blip_image_processor(im) for im in images])
 
-        # For continuation mode, drop the first frame from the generation targets
+        # Slice target images for generation. 
+        # In 'continuation' mode, frame 0 is the starting context (given), and we only generate frames 1-4.
+        # Otherwise, we generate all 5 frames.
         gen_images = images[1:] if self.args.task == 'continuation' else images
         if self.subset in ['train', 'val']:
+            # Apply training augmentations (384x384 normalized tensors)
             images_tensor: Tensor = torch.stack([self.augment(im) for im in gen_images])
         else:
+            # For testing/predicting, return raw numpy images for evaluation/visualization
             images_tensor = torch.from_numpy(np.array(gen_images))
 
-        # Parse pipe-separated captions
+        # Retrieve and parse the pipe-separated text captions for the 5 frames
         texts = self.h5['text'][index].decode('utf-8').split('|')
 
-        # CLIP tokenization (generation targets)
+        # Tokenize target text prompts using the CLIP tokenizer.
+        # In continuation mode, we discard the caption of the first (context) frame.
         clip_texts = texts[1:] if self.args.task == 'continuation' else texts
         clip_tok = self.clip_tokenizer(
             clip_texts,
@@ -128,7 +141,8 @@ class StoryDataset(Dataset):
         captions: Tensor = clip_tok['input_ids']
         attention_mask: Tensor = clip_tok['attention_mask']
 
-        # BLIP tokenization (all 5 frames for source context)
+        # Tokenize source/conditioning text prompts using the BLIP tokenizer.
+        # Here we tokenize all 5 captions to serve as contextual history for the model.
         blip_tok = self.blip_tokenizer(
             texts,
             padding="max_length",
@@ -142,16 +156,22 @@ class StoryDataset(Dataset):
         return images_tensor, captions, attention_mask, source_images, source_caption, source_attention_mask
 
     def __getstate__(self):
-        """Exclude the open HDF5 handle from pickling (for DataLoader workers)."""
+        """
+        Exclude the open HDF5 file handle when pickling the dataset instance.
+        This is necessary for PyTorch's multi-process DataLoader workers.
+        """
         state = self.__dict__.copy()
         state.pop('h5', None)
         return state
 
     def __setstate__(self, state):
+        # Restore state on workers; the file handle will be lazily re-opened
         self.__dict__.update(state)
 
     def __len__(self) -> int:
+        # Cache the dataset length to avoid reading the file metadata repeatedly
         if not hasattr(self, '_len'):
             with h5py.File(self.h5_file, "r") as h5:
                 self._len = len(h5[self.subset]['text'])
         return self._len
+

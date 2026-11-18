@@ -104,8 +104,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
 
-        # 1. Transformer2DModel can process both standard continous images of shape `(batch_size, num_channels, width, height)` as well as quantized image embeddings of shape `(batch_size, num_image_vectors)`
-        # Define whether input is continuous or discrete depending on configuration
+        # Differing from the original Transformer2DModel: this version supports both continuous image tensors
+        # and discrete/vectorized inputs (for VQ-VAE style models). The input type determines how we project.
         self.is_input_continuous = in_channels is not None
         self.is_input_vectorized = num_vector_embeds is not None
 
@@ -120,13 +120,15 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 " sure that either `in_channels` or `num_vector_embeds` is not None."
             )
 
-        # 2. Define input layers
+        # Handle input projection for continuous images: normalize then project to inner dimension.
+        # This differs from the standard transformer which typically doesn't include GroupNorm.
         if self.is_input_continuous:
             self.in_channels = in_channels
 
             self.norm = torch.nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
             self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0)
         elif self.is_input_vectorized:
+            # For discrete/vectorized input, we need positional embeddings to encode spatial location.
             assert sample_size is not None, "Transformer2DModel over discrete input must provide sample_size"
             assert num_vector_embeds is not None, "Transformer2DModel over discrete input must provide num_embed"
 
@@ -139,7 +141,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 num_embed=num_vector_embeds, embed_dim=inner_dim, height=self.height, width=self.width
             )
 
-        # 3. Define transformers blocks
+        # Create transformer blocks that will process the input sequentially.
+        # Differs from standard transformers: uses GEGLU activation by default and supports AdaLayerNorm for time steps.
         self.transformer_blocks = nn.ModuleList(
             [
                 BasicTransformerBlock(
@@ -156,7 +159,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             ]
         )
 
-        # 4. Define output layers
+        # Output projection: map back to input space (continuous) or to vocab predictions (vectorized).
+        # Unlike the original which only has projection for continuous input, this supports both.
         if self.is_input_continuous:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
         elif self.is_input_vectorized:
@@ -189,7 +193,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             if `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is the sample
             tensor.
         """
-        # 1. Input
+        # 1. Input: reshape image tensor to sequence format (B, H*W, C) for transformer processing.
+        # This differs from text transformers which already have sequence format; images need reshaping.
         if self.is_input_continuous:
             batch, channel, height, weight = hidden_states.shape
             residual = hidden_states
@@ -198,14 +203,17 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             inner_dim = hidden_states.shape[1]
             hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
         elif self.is_input_vectorized:
+            # For discrete inputs, embed the class tokens and add positional embeddings.
             hidden_states = self.latent_image_embedding(hidden_states)
 
-        # 2. Blocks
+        # 2. Process through transformer blocks.
+        # Differs from standard transformers: each block handles both self-attention and optional cross-attention.
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, context=encoder_hidden_states, mask=encoder_attention_mask,
                                   timestep=timestep)
 
-        # 3. Output
+        # 3. Output: reshape back to image format and add skip connection.
+        # For vectorized inputs, we compute log probabilities over the vocabulary.
         if self.is_input_continuous:
             hidden_states = hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2)
             hidden_states = self.proj_out(hidden_states)
@@ -216,7 +224,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             # (batch, self.num_vector_embeds - 1, self.num_latent_pixels)
             logits = logits.permute(0, 2, 1)
 
-            # log(p(x_0))
+            # log(p(x_0)) - compute log probabilities for discrete diffusion models
             output = F.log_softmax(logits.double(), dim=1).float()
 
         if not return_dict:
@@ -236,13 +244,8 @@ class AttentionBlock(nn.Module):
     https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
     Uses three q, k, v linear layers to compute attention.
 
-    Parameters:
-        channels (`int`): The number of channels in the input and output.
-        num_head_channels (`int`, *optional*):
-            The number of channels in each head. If None, then `num_heads` = 1.
-        norm_num_groups (`int`, *optional*, defaults to 32): The number of groups to use for group norm.
-        rescale_output_factor (`float`, *optional*, defaults to 1.0): The factor to rescale the output by.
-        eps (`float`, *optional*, defaults to 1e-5): The epsilon value to use for group norm.
+    Differs from the original transformer attention: includes GroupNorm preprocessing (instead of just LayerNorm)
+    and an optional rescaling factor to stabilize training in diffusion models.
     """
 
     def __init__(
@@ -256,16 +259,19 @@ class AttentionBlock(nn.Module):
         super().__init__()
         self.channels = channels
 
+        # Compute number of heads from channel count and head size.
+        # Differing from standard multi-head attention: uses a more flexible head dimension calculation.
         self.num_heads = channels // num_head_channels if num_head_channels is not None else 1
         self.num_head_size = num_head_channels
         self.group_norm = nn.GroupNorm(num_channels=channels, num_groups=norm_num_groups, eps=eps, affine=True)
 
-        # define q,k,v as linear layers
+        # Query, key, value projection layers - standard attention mechanism.
         self.query = nn.Linear(channels, channels)
         self.key = nn.Linear(channels, channels)
         self.value = nn.Linear(channels, channels)
 
         self.rescale_output_factor = rescale_output_factor
+        # Output projection with optional rescaling for stable training.
         self.proj_attn = nn.Linear(channels, channels, 1)
 
     def transpose_for_scores(self, projection: torch.Tensor) -> torch.Tensor:
@@ -275,41 +281,47 @@ class AttentionBlock(nn.Module):
         return new_projection
 
     def forward(self, hidden_states):
+        # Residual connection is added at the end for gradient flow.
         residual = hidden_states
         batch, channel, height, width = hidden_states.shape
 
-        # norm
+        # Normalize input with GroupNorm - differs from standard attention which uses LayerNorm or no norm.
+        # This helps stabilize training in diffusion UNet architectures.
         hidden_states = self.group_norm(hidden_states)
 
+        # Reshape: (B, C, H, W) -> (B, H*W, C) for sequence processing.
+        # This makes spatial positions attend to each other.
         hidden_states = hidden_states.view(batch, channel, height * width).transpose(1, 2)
 
-        # proj to q, k, v
+        # Project to query, key, value vectors via linear layers.
         query_proj = self.query(hidden_states)
         key_proj = self.key(hidden_states)
         value_proj = self.value(hidden_states)
 
-        # transpose
+        # Reshape to separate heads: (B, N, C) -> (B, H, N, D) where H=num_heads, D=head_dim.
         query_states = self.transpose_for_scores(query_proj)
         key_states = self.transpose_for_scores(key_proj)
         value_states = self.transpose_for_scores(value_proj)
 
-        # get scores
+        # Compute attention scores with an unusual scaling: uses sqrt(sqrt()) instead of just sqrt().
+        # This differs from standard scaled dot-product attention scaling.
         scale = 1 / math.sqrt(math.sqrt(self.channels / self.num_heads))
-        attention_scores = torch.matmul(query_states * scale, key_states.transpose(-1, -2) * scale)  # TODO: use baddmm
+        attention_scores = torch.matmul(query_states * scale, key_states.transpose(-1, -2) * scale)
         attention_probs = torch.softmax(attention_scores.float(), dim=-1).type(attention_scores.dtype)
 
-        # compute attention output
+        # Apply attention to values to get the output.
         hidden_states = torch.matmul(attention_probs, value_states)
 
+        # Reshape: (B, H, N, D) -> (B, N, C) to restore original shape.
         hidden_states = hidden_states.permute(0, 2, 1, 3).contiguous()
         new_hidden_states_shape = hidden_states.size()[:-2] + (self.channels,)
         hidden_states = hidden_states.view(new_hidden_states_shape)
 
-        # compute next hidden_states
+        # Final linear projection.
         hidden_states = self.proj_attn(hidden_states)
         hidden_states = hidden_states.transpose(-1, -2).reshape(batch, channel, height, width)
 
-        # res connect and rescale
+        # Residual connection with rescaling - this rescaling factor helps with training stability.
         hidden_states = (hidden_states + residual) / self.rescale_output_factor
         return hidden_states
 
@@ -318,17 +330,9 @@ class BasicTransformerBlock(nn.Module):
     r"""
     A basic Transformer block.
 
-    Parameters:
-        dim (`int`): The number of channels in the input and output.
-        num_attention_heads (`int`): The number of heads to use for multi-head attention.
-        attention_head_dim (`int`): The number of channels in each head.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        cross_attention_dim (`int`, *optional*): The size of the context vector for cross attention.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        num_embeds_ada_norm (:
-            obj: `int`, *optional*): The number of diffusion steps used during training. See `Transformer2DModel`.
-        attention_bias (:
-            obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
+    Differs from the original transformer: includes two attention layers (self-attention + optional cross-attention)
+    and uses AdaLayerNorm when num_embeds_ada_norm is provided, allowing the normalization to be conditioned
+    on the diffusion timestep. This is key for diffusion models where the denoiser needs to know the noise level.
     """
 
     def __init__(
@@ -343,14 +347,20 @@ class BasicTransformerBlock(nn.Module):
             attention_bias: bool = False,
     ):
         super().__init__()
+        # Self-attention: allows each position to attend to all other positions.
+        # Differing from standard transformers: uses custom CrossAttention that supports memory-efficient variants.
         self.attn1 = CrossAttention(
             query_dim=dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             dropout=dropout,
             bias=attention_bias,
-        )  # is a self-attention
+        )
+        # Feed-forward network with GEGLU activation (or GELU approximate).
+        # GEGLU differs from standard transformers which use GELU or ReLU.
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn)
+        # Cross-attention: allows attending to encoder hidden states (e.g., text embeddings in text-to-image).
+        # When context is None, this becomes self-attention again.
         self.attn2 = CrossAttention(
             query_dim=dim,
             cross_attention_dim=cross_attention_dim,
@@ -358,9 +368,10 @@ class BasicTransformerBlock(nn.Module):
             dim_head=attention_head_dim,
             dropout=dropout,
             bias=attention_bias,
-        )  # is self-attn if context is none
+        )
 
-        # layer norms
+        # Layer norms: either AdaLayerNorm (timestep-conditioned) or standard LayerNorm.
+        # AdaLayerNorm is what makes this block suited for diffusion models.
         self.use_ada_layer_norm = num_embeds_ada_norm is not None
         if self.use_ada_layer_norm:
             self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm)
@@ -401,19 +412,22 @@ class BasicTransformerBlock(nn.Module):
             self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
     def forward(self, hidden_states, context=None, mask=None, timestep=None):
-        # 1. Self-Attention
+        # 1. Self-Attention with residual connection.
+        # The timestep is passed to AdaLayerNorm to condition the normalization.
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         )
         hidden_states = self.attn1(norm_hidden_states) + hidden_states
 
-        # 2. Cross-Attention
+        # 2. Cross-Attention with residual connection.
+        # Allows the model to attend to context (e.g., text embeddings) if provided.
         norm_hidden_states = (
             self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
         )
         hidden_states = self.attn2(norm_hidden_states, context=context, mask=mask) + hidden_states
 
-        # 3. Feed-forward
+        # 3. Feed-forward with residual connection.
+        # Uses GEGLU or ApproximateGELU activation instead of standard GELU.
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         return hidden_states
@@ -423,15 +437,9 @@ class CrossAttention(nn.Module):
     r"""
     A cross attention layer.
 
-    Parameters:
-        query_dim (`int`): The number of channels in the query.
-        cross_attention_dim (`int`, *optional*):
-            The number of channels in the context. If not given, defaults to `query_dim`.
-        heads (`int`,  *optional*, defaults to 8): The number of heads to use for multi-head attention.
-        dim_head (`int`,  *optional*, defaults to 64): The number of channels in each head.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        bias (`bool`, *optional*, defaults to False):
-            Set to `True` for the query, key, and value linear layers to contain a bias parameter.
+    Differs from the original transformer cross-attention: supports memory-efficient attention variants
+    (xformers) and sliced attention for large batch sizes, which are essential optimizations for
+    diffusion model training.
     """
 
     def __init__(
@@ -447,18 +455,20 @@ class CrossAttention(nn.Module):
         inner_dim = dim_head * heads
         cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
 
+        # Scale factor for attention scores - standard 1/sqrt(dim_head) scaling.
         self.scale = dim_head ** -0.5
         self.heads = heads
-        # for slice_size > 0 the attention score computation
-        # is split across the batch axis to save memory
-        # You can set slice_size with `set_attention_slice`
+        # These flags enable memory-efficient attention optimizations.
+        # _slice_size splits attention computation across batch axis to save memory.
         self._slice_size = None
         self._use_memory_efficient_attention_xformers = False
 
+        # Query, key, value linear projections.
         self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
         self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
         self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
 
+        # Output projection with dropout for regularization.
         self.to_out = nn.ModuleList([])
         self.to_out.append(nn.Linear(inner_dim, query_dim))
         self.to_out.append(nn.Dropout(dropout))
@@ -480,6 +490,7 @@ class CrossAttention(nn.Module):
     def forward(self, hidden_states, context=None, mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
+        # Project to query, key, value. Context defaults to hidden_states for self-attention.
         query = self.to_q(hidden_states)
         context = context if context is not None else hidden_states
         key = self.to_k(context)
@@ -487,12 +498,18 @@ class CrossAttention(nn.Module):
 
         dim = query.shape[-1]
 
+        # Reshape for efficient multi-head attention: batch dims combined so each head is processed independently.
         query = self.reshape_heads_to_batch_dim(query)
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
+
+        # Expand mask across heads for broadcasting.
         mask = mask.repeat_interleave(self.heads, dim=0).unsqueeze(1) if mask is not None else None
 
-        # attention, what we cannot get enough of
+        # Compute attention using one of three methods:
+        # 1. xformers: memory-efficient external library for large-scale attention
+        # 2. SDPA: PyTorch's built-in scaled dot-product attention (most efficient)
+        # 3. Sliced: splits batch dimension to save memory when needed
         if self._use_memory_efficient_attention_xformers:
             hidden_states = self._memory_efficient_attention_xformers(query, key, value)
         else:
@@ -502,49 +519,45 @@ class CrossAttention(nn.Module):
                 assert mask is None, "masking is not supported for sliced attention"
                 hidden_states = self._sliced_attention(query, key, value, sequence_length, dim)
 
-        # linear proj
+        # Project back to original dimension and apply dropout.
         hidden_states = self.to_out[0](hidden_states)
-        # dropout
         hidden_states = self.to_out[1](hidden_states)
         return hidden_states
 
     def _attention(self, query, key, value, mask):
+        # Try to use PyTorch's optimized scaled dot-product attention (SDPA) if available (PyTorch 2.0+).
+        # SDPA is more memory-efficient and often faster than manual implementation.
         if hasattr(F, "scaled_dot_product_attention"):
-            # Use PyTorch's built-in memory-efficient attention (SDPA)
-            # It supports masks and handles memory optimization automatically.
-            # Note: mask should be a boolean tensor where True means "mask out" for masked_fill,
-            # but SDPA expects True for "keep". We invert if necessary.
-            
-            # The current mask has True for masked-out positions. 
-            # SDPA attn_mask: True means keep, False means mask.
-            # So we pass ~mask.
+            # SDPA expects mask where True means "keep" (attend to), but our mask has True for "mask out".
+            # We invert the mask to match SDPA's convention.
             attn_mask = ~mask if mask is not None else None
-            
+
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
             )
         else:
-            # Fallback for older PyTorch versions
+            # Fallback implementation for older PyTorch versions.
+            # Uses einsum on MPS (Metal) for better performance on Apple Silicon GPUs.
             if query.device.type == "mps":
-                # Better performance on mps (~20-25%)
                 attention_scores = torch.einsum("b i d, b j d -> b i j", query, key) * self.scale
             else:
                 attention_scores = torch.matmul(query, key.transpose(-1, -2)) * self.scale
             attention_scores = attention_scores.masked_fill(mask.expand(attention_scores.shape), value=float("-inf")) \
                 if mask is not None else attention_scores
             attention_probs = attention_scores.softmax(dim=-1)
-            # compute attention output
-    
+
             if query.device.type == "mps":
                 hidden_states = torch.einsum("b i j, b j d -> b i d", attention_probs, value)
             else:
                 hidden_states = torch.matmul(attention_probs, value)
 
-        # reshape hidden_states
+        # Reshape from (B*H, N, D) back to (B, N, C) for the next layer.
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
     def _sliced_attention(self, query, key, value, sequence_length, dim):
+        # When batch size is too large for memory, process attention in slices.
+        # This trades compute time for memory efficiency.
         batch_size_attention = query.shape[0]
         hidden_states = torch.zeros(
             (batch_size_attention, sequence_length, dim // self.heads), device=query.device, dtype=query.dtype
@@ -554,7 +567,7 @@ class CrossAttention(nn.Module):
             start_idx = i * slice_size
             end_idx = (i + 1) * slice_size
             if query.device.type == "mps":
-                # Better performance on mps (~20-25%)
+                # MPS devices (Apple Silicon) perform better with einsum.
                 attn_slice = (
                         torch.einsum("b i d, b j d -> b i j", query[start_idx:end_idx], key[start_idx:end_idx])
                         * self.scale
@@ -562,7 +575,7 @@ class CrossAttention(nn.Module):
             else:
                 attn_slice = (
                         torch.matmul(query[start_idx:end_idx], key[start_idx:end_idx].transpose(1, 2)) * self.scale
-                )  # TODO: use baddbmm for better performance
+                )
             attn_slice = attn_slice.softmax(dim=-1)
             if query.device.type == "mps":
                 attn_slice = torch.einsum("b i j, b j d -> b i d", attn_slice, value[start_idx:end_idx])
@@ -571,11 +584,11 @@ class CrossAttention(nn.Module):
 
             hidden_states[start_idx:end_idx] = attn_slice
 
-        # reshape hidden_states
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
     def _memory_efficient_attention_xformers(self, query, key, value):
+        # Use xformers library for memory-efficient attention on very large models.
         hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=None)
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
@@ -585,12 +598,8 @@ class FeedForward(nn.Module):
     r"""
     A feed-forward layer.
 
-    Parameters:
-        dim (`int`): The number of channels in the input.
-        dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
-        mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
+    Differs from the original transformer FFN: uses GEGLU or ApproximateGELU instead of GELU,
+    which have been shown to work better for diffusion model training stability.
     """
 
     def __init__(
@@ -605,17 +614,16 @@ class FeedForward(nn.Module):
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
 
+        # Choose activation: GEGLU (gated linear unit) or ApproximateGELU.
+        # GEGLU doubles the hidden dimension and uses a learned gate, differing from standard GELU.
         if activation_fn == "geglu":
             geglu = GEGLU(dim, inner_dim)
         elif activation_fn == "geglu-approximate":
             geglu = ApproximateGELU(dim, inner_dim)
 
         self.net = nn.ModuleList([])
-        # project in
         self.net.append(geglu)
-        # project dropout
         self.net.append(nn.Dropout(dropout))
-        # project out
         self.net.append(nn.Linear(inner_dim, dim_out))
 
     def forward(self, hidden_states):
@@ -629,31 +637,33 @@ class GEGLU(nn.Module):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
 
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
+    Differs from standard GELU: splits projection in half and uses one half as a gate for the other,
+    creating a learnable gating mechanism that can improve training dynamics in diffusion models.
     """
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
+        # Double the output dimension to split into value and gate projections.
         self.proj = nn.Linear(dim_in, dim_out * 2)
 
     def gelu(self, gate):
+        # MPS (Metal) devices need float32 for GELU, then convert back.
         if gate.device.type != "mps":
             return F.gelu(gate)
-        # mps: gelu is not implemented for float16
         return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
 
     def forward(self, hidden_states):
+        # Split the projection output into value and gate, apply GELU to gate.
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
         return hidden_states * self.gelu(gate)
 
 
 class ApproximateGELU(nn.Module):
     """
-    The approximate form of Gaussian Error Linear Unit (GELU)
+    The approximate form of Gaussian Error Linear Unit (GELU).
 
-    For more details, see section 2: https://arxiv.org/abs/1606.08415
+    Differs from standard GELU: uses sigmoid approximation x * sigmoid(1.702 * x) which is faster
+    to compute and was used in earlier transformer implementations.
     """
 
     def __init__(self, dim_in: int, dim_out: int):
@@ -662,23 +672,32 @@ class ApproximateGELU(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
+        # Approximate GELU using sigmoid: faster than exact GELU, often used in early transformers.
         return x * torch.sigmoid(1.702 * x)
 
 
 class AdaLayerNorm(nn.Module):
     """
     Norm layer modified to incorporate timestep embeddings.
+    Differs from standard LayerNorm: the scale and shift parameters are dynamically computed
+    from the timestep embedding, allowing the normalization to be conditioned on the diffusion step.
     """
 
     def __init__(self, embedding_dim, num_embeddings):
         super().__init__()
+        # Embedding that maps timestep indices to vectors.
         self.emb = nn.Embedding(num_embeddings, embedding_dim)
+        # Use SiLU (Swish) activation to create smoother timestep embeddings.
         self.silu = nn.SiLU()
+        # Project to get both scale and shift parameters from the embedding.
         self.linear = nn.Linear(embedding_dim, embedding_dim * 2)
+        # LayerNorm without learnable affine parameters - we'll provide them dynamically.
         self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False)
 
     def forward(self, x, timestep):
+        # Compute scale and shift from timestep embedding.
         emb = self.linear(self.silu(self.emb(timestep)))
         scale, shift = torch.chunk(emb, 2)
+        # Apply LayerNorm then modulate with the computed scale and shift.
         x = self.norm(x) * (1 + scale) + shift
         return x
